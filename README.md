@@ -6,7 +6,7 @@ This is an independent learning and portfolio project, not professional employme
 
 ## MVP features
 
-- Account registration, sign-in, and sign-out
+- Account registration with expiring email confirmation, sign-in, and sign-out
 - PostgreSQL-backed sessions with HTTP-only cookies
 - Scrypt password hashing using Node's built-in crypto module
 - Project creation and project-scoped freelancer/client roles
@@ -21,14 +21,14 @@ This is an independent learning and portfolio project, not professional employme
 - **Client:** React, Vite, JavaScript, responsive CSS
 - **API:** Node.js, Express, REST
 - **Database:** PostgreSQL with additive SQL migrations
-- **Authentication:** scrypt password hashes and opaque server-side sessions
+- **Authentication:** email confirmation, scrypt password hashes, and opaque server-side sessions
 - **Authorization:** project membership roles checked on each protected request
 
 ## Run locally
 
 Requirements: Node.js 20.19+ and a PostgreSQL database. Keep database credentials private and use a connection string with a current password.
 
-1. In `server/`, create `.env` from `.env.example`. Set `DATABASE_URL` to your PostgreSQL connection string and set `SESSION_SECRET` to a long random value. Keep `.env` private.
+1. In `server/`, create `.env` from `.env.example`. Set `DATABASE_URL` to your PostgreSQL connection string and set `SESSION_SECRET` to a long random value. Keep `.env` private. For local email confirmation, you can leave Resend settings blank; the API will print a development-only link.
 2. Open a terminal in `server/` and run:
 
    ```sh
@@ -48,7 +48,9 @@ Requirements: Node.js 20.19+ and a PostgreSQL database. Keep database credential
 
 The API is at `http://localhost:4000`. Its health endpoint is `http://localhost:4000/api/health`. Vite forwards `/api` requests to the API during local development.
 
-Migrations are safe to run more than once. Migration `001_initial_schema.sql` creates the project data tables; migration `002_sessions.sql` adds persistent login sessions. The migration runner skips versions already recorded in `schema_migrations`.
+Migrations are safe to run more than once. Migration `001_initial_schema.sql` creates the project data tables; migration `002_sessions.sql` adds persistent login sessions; migration `003_email_verification.sql` adds email confirmation. Existing accounts are kept usable when the new migration is applied. The migration runner skips versions already recorded in `schema_migrations`.
+
+For production email delivery, set `RESEND_API_KEY` and `RESEND_FROM_EMAIL` on the API service. Resend requires a verified sender domain for normal delivery. The app uses Render's `RENDER_EXTERNAL_URL` to build verification links unless `APP_ORIGIN` is set explicitly.
 
 ## Client invitation flow
 

@@ -3,7 +3,12 @@ import { useEffect, useMemo, useState } from 'react';
 async function api(path, options = {}) {
   const response = await fetch(`/api${path}`, { credentials: 'include', headers: { 'Content-Type': 'application/json', ...options.headers }, ...options });
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error?.message || 'Something went wrong. Please try again.');
+  if (!response.ok) {
+    const error = new Error(data.error?.message || 'Something went wrong. Please try again.');
+    error.code = data.error?.code;
+    error.email = data.error?.email;
+    throw error;
+  }
   return data;
 }
 
@@ -16,13 +21,17 @@ export default function App() {
   const [projects, setProjects] = useState([]);
   const [project, setProject] = useState(null);
   const [page, setPage] = useState('overview');
-  const [authMode, setAuthMode] = useState('login');
+  const [authMode, setAuthMode] = useState(() => new URLSearchParams(location.search).has('verify') ? 'verify-link' : 'login');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [notice, setNotice] = useState('');
+  const [authNotice, setAuthNotice] = useState('');
+  const [pendingEmail, setPendingEmail] = useState('');
+  const [verificationUrl, setVerificationUrl] = useState('');
   const [dialog, setDialog] = useState('');
   const [inviteUrl, setInviteUrl] = useState('');
   const [inviteToken, setInviteToken] = useState(new URLSearchParams(location.search).get('invite'));
+  const [verificationToken, setVerificationToken] = useState(new URLSearchParams(location.search).get('verify'));
 
   async function refreshProjects(preferredId) {
     const result = await api('/projects');
@@ -64,11 +73,54 @@ export default function App() {
     const form = new FormData(event.currentTarget);
     const body = Object.fromEntries(form.entries());
     try {
-      const { user: current } = await api(`/auth/${authMode === 'register' ? 'register' : 'login'}`, { method: 'POST', body: JSON.stringify(body) });
+      const result = await api(`/auth/${authMode === 'register' ? 'register' : 'login'}`, { method: 'POST', body: JSON.stringify(body) });
+      if (authMode === 'register') {
+        setPendingEmail(result.email);
+        setVerificationUrl(result.verificationUrl || '');
+        setAuthNotice('');
+        setAuthMode('verify-sent');
+        return;
+      }
+      const current = result.user;
       setUser(current);
       await refreshProjects();
       if (inviteToken) await acceptInvite(inviteToken);
+    } catch (e) {
+      if (e.code === 'EMAIL_NOT_VERIFIED') {
+        setPendingEmail(e.email || body.email);
+        setVerificationUrl('');
+        setAuthMode('verify-sent');
+        setError('');
+      } else setError(e.message);
+    }
+  }
+
+  async function resendVerification() {
+    setError('');
+    try {
+      const result = await api('/auth/resend-verification', { method: 'POST', body: JSON.stringify({ email: pendingEmail }) });
+      setVerificationUrl(result.verificationUrl || '');
+      setAuthNotice(result.message);
     } catch (e) { setError(e.message); }
+  }
+
+  async function verifyEmail() {
+    setError('');
+    try {
+      const result = await api('/auth/verify-email', { method: 'POST', body: JSON.stringify({ token: verificationToken }) });
+      setVerificationToken('');
+      history.replaceState({}, '', location.pathname);
+      setAuthMode('login');
+      setAuthNotice(result.message);
+      if (user) setNotice(result.message);
+    } catch (e) { setError(e.message); }
+  }
+
+  function cancelVerification() {
+    setVerificationToken('');
+    history.replaceState({}, '', location.pathname);
+    setAuthMode('login');
+    setError('');
   }
 
   async function signOut() {
@@ -132,7 +184,8 @@ export default function App() {
   }), [projects]);
 
   if (loading) return <div className="loading-screen"><div className="brand-mark">S</div><p>Opening your workspace…</p></div>;
-  if (!user) return <AuthScreen mode={authMode} setMode={setAuthMode} onSubmit={submitAuth} error={error} inviteToken={inviteToken} />;
+  if (verificationToken) return <AuthScreen mode="verify-link" setMode={setAuthMode} onSubmit={submitAuth} error={error} inviteToken={inviteToken} onVerify={verifyEmail} onCancelVerification={cancelVerification} />;
+  if (!user) return <AuthScreen mode={authMode} setMode={setAuthMode} onSubmit={submitAuth} error={error} inviteToken={inviteToken} pendingEmail={pendingEmail} verificationUrl={verificationUrl} authNotice={authNotice} onResend={resendVerification} />;
 
   return (
     <div className="app-shell">
@@ -167,10 +220,17 @@ export default function App() {
   );
 }
 
-function AuthScreen({ mode, setMode, onSubmit, error, inviteToken }) {
-  return <main className="auth-screen"><div className="auth-brand"><span className="brand-mark">S</span><b>scope<span className="brand-light">track</span></b></div><div className="auth-card"><div className="auth-symbol">✳</div><p className="eyebrow">A BETTER WAY TO WORK TOGETHER</p><h1>{inviteToken ? 'You’re invited.' : mode === 'register' ? 'Create your workspace.' : 'Welcome back.'}</h1><p className="auth-subtitle">{inviteToken ? 'Sign in or create an account with the invited email to join your project.' : mode === 'register' ? 'A clear home for freelance work and client approvals.' : 'Sign in to pick up where your projects left off.'}</p>
-    <form onSubmit={onSubmit} className="form-stack auth-form">{mode === 'register' && <label>Your name<input name="fullName" required minLength="2" maxLength="120" autoComplete="name" placeholder="Your full name" /></label>}<label>Email address<input name="email" type="email" required autoComplete="email" placeholder="you@example.com" /></label><label>Password<input name="password" type="password" minLength={mode === 'register' ? 10 : 1} required autoComplete={mode === 'register' ? 'new-password' : 'current-password'} placeholder={mode === 'register' ? 'At least 10 characters' : 'Your password'} /></label>{error && <p className="form-error">{error}</p>}<button className="primary-button full-button">{mode === 'register' ? 'Create account' : 'Sign in'} <span>→</span></button></form>
-    <p className="auth-switch">{mode === 'register' ? 'Already have an account?' : 'New to ScopeTrack?'} <button onClick={() => setMode(mode === 'register' ? 'login' : 'register')}>{mode === 'register' ? 'Sign in' : 'Create an account'}</button></p></div><p className="auth-foot">Built for clear scope, thoughtful delivery, and better client relationships.</p></main>;
+function AuthScreen({ mode, setMode, onSubmit, error, inviteToken, pendingEmail, verificationUrl, authNotice, onResend, onVerify, onCancelVerification }) {
+  const verificationSent = mode === 'verify-sent';
+  const verifyLink = mode === 'verify-link';
+  return <main className="auth-screen"><div className="auth-brand"><span className="brand-mark">S</span><b>scope<span className="brand-light">track</span></b></div><div className="auth-card"><div className="auth-symbol">{verificationSent || verifyLink ? '✉' : '✳'}</div><p className="eyebrow">A BETTER WAY TO WORK TOGETHER</p>
+    {verificationSent ? <><h1>Check your inbox.</h1><p className="auth-subtitle">We sent a verification link to <strong>{pendingEmail}</strong>. Open it to confirm you can receive email there, then sign in.</p>{verificationUrl && <a className="verify-dev-link" href={verificationUrl}>Open local verification link <span>↗</span></a>}{authNotice && <p className="auth-notice">{authNotice}</p>}{error && <p className="form-error">{error}</p>}<button className="primary-button full-button" onClick={onResend}>Resend verification email</button><p className="auth-switch">Already verified? <button onClick={() => { setMode('login'); }}>Sign in</button></p></>
+      : verifyLink ? <><h1>Verify your email.</h1><p className="auth-subtitle">Click below to confirm that you can receive messages at this address. The link can only be used once.</p>{error && <p className="form-error">{error}</p>}<button className="primary-button full-button" onClick={onVerify}>Verify email address <span>→</span></button><p className="auth-switch"><button onClick={onCancelVerification}>Back to sign in</button></p></>
+        : <><h1>{inviteToken ? 'You’re invited.' : mode === 'register' ? 'Create your workspace.' : 'Welcome back.'}</h1><p className="auth-subtitle">{inviteToken ? 'Sign in or create an account with the invited email to join your project.' : mode === 'register' ? 'A clear home for freelance work and client approvals. We’ll verify your email before your first sign-in.' : 'Sign in to pick up where your projects left off.'}</p>
+          {authNotice && <p className="auth-notice">{authNotice}</p>}
+          <form onSubmit={onSubmit} className="form-stack auth-form">{mode === 'register' && <label>Your name<input name="fullName" required minLength="2" maxLength="120" autoComplete="name" placeholder="Your full name" /></label>}<label>Email address<input name="email" type="email" required autoComplete="email" placeholder="you@example.com" /></label><label>Password<input name="password" type="password" minLength={mode === 'register' ? 10 : 1} required autoComplete={mode === 'register' ? 'new-password' : 'current-password'} placeholder={mode === 'register' ? 'At least 10 characters' : 'Your password'} /></label>{error && <p className="form-error">{error}</p>}<button className="primary-button full-button">{mode === 'register' ? 'Create account' : 'Sign in'} <span>→</span></button></form>
+          <p className="auth-switch">{mode === 'register' ? 'Already have an account?' : 'New to ScopeTrack?'} <button onClick={() => { setMode(mode === 'register' ? 'login' : 'register'); }}>{mode === 'register' ? 'Sign in' : 'Create an account'}</button></p></>}
+    </div><p className="auth-foot">Built for clear scope, thoughtful delivery, and better client relationships.</p></main>;
 }
 
 function Overview({ user, projects, summary, onCreate, onOpen }) {
