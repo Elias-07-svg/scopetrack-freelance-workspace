@@ -8,11 +8,19 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: 24.21.0
       - key: DATABASE_URL
         sync: false
-      - key: SESSION_SECRET
-        generateValue: true
-      - key: RESEND_API_KEY
+      - key: FIREBASE_PROJECT_ID
+        value: scopetrack-edca2
+      - key: VITE_FIREBASE_API_KEY
         sync: false
-      - key: RESEND_FROM_EMAIL
+      - key: VITE_FIREBASE_AUTH_DOMAIN
+        sync: false
+      - key: VITE_FIREBASE_PROJECT_ID
+        value: scopetrack-edca2
+      - key: VITE_FIREBASE_APP_ID
+        sync: false
+      - key: VITE_FIREBASE_MESSAGING_SENDER_ID
         sync: false

@@ -1,115 +1,87 @@
+import { createRemoteJWKSet, jwtVerify } from 'jose';
 import { Router } from 'express';
 import { getPool } from './db.js';
-import { cookieOptions, hashPassword, hashToken, newToken, signSessionId, validSessionCookie, verifyPassword } from './security.js';
-import { emailDeliveryConfigured, makeVerificationLink, sendVerificationEmail } from './mail.js';
+import { hashToken } from './security.js';
 
 const router = Router();
 const db = () => getPool();
-const cookieName = 'scopetrack_session';
-const readCookie = (request) => request.headers.cookie?.split(';').map((entry) => entry.trim()).find((entry) => entry.startsWith(`${cookieName}=`))?.slice(cookieName.length + 1);
+const firebaseProjectId = () => process.env.FIREBASE_PROJECT_ID || process.env.VITE_FIREBASE_PROJECT_ID;
+const firebaseKeys = createRemoteJWKSet(new URL('https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com'));
 
-export async function requireAuth(request, response, next) {
-  try {
-    const sessionId = validSessionCookie(readCookie(request));
-    if (!sessionId) return response.status(401).json({ error: { message: 'Please sign in to continue.' } });
-    const result = await db().query(`SELECT u.id, u.full_name, u.email, u.email_verified_at FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.id = $1 AND s.expires_at > NOW()`, [hashToken(sessionId)]);
-    if (!result.rowCount) return response.status(401).json({ error: { message: 'Your session expired. Please sign in again.' } });
-    if (!result.rows[0].email_verified_at) return response.status(403).json({ error: { code: 'EMAIL_NOT_VERIFIED', message: 'Verify your email address before using ScopeTrack.' } });
-    request.user = result.rows[0];
-    request.sessionId = sessionId;
-    next();
-  } catch (error) { next(error); }
-}
-
-async function startSession(userId, response) {
-  const id = newToken();
-  await db().query('INSERT INTO sessions (id, user_id, expires_at) VALUES ($1, $2, NOW() + INTERVAL \'14 days\')', [hashToken(id), userId]);
-  response.setHeader('Set-Cookie', `${cookieName}=${id}.${signSessionId(id)}; ${cookieOptions()}`);
-}
-
-async function issueVerification(user) {
-  const token = newToken();
-  await db().query('UPDATE email_verifications SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL', [user.id]);
-  await db().query(`INSERT INTO email_verifications (user_id, token_hash, expires_at) VALUES ($1, $2, NOW() + INTERVAL '24 hours')`, [user.id, hashToken(token)]);
-  const link = makeVerificationLink(token);
-  const sent = await sendVerificationEmail(user.email, link);
-  return { emailVerificationRequired: true, ...(!sent ? { verificationUrl: link } : {}) };
-}
-
-router.post('/register', async (request, response, next) => {
-  try {
-    const fullName = String(request.body.fullName || '').trim();
-    const email = String(request.body.email || '').trim().toLowerCase();
-    const password = String(request.body.password || '');
-    if (fullName.length < 2 || fullName.length > 120) return response.status(400).json({ error: { message: 'Enter your name (2–120 characters).' } });
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 254) return response.status(400).json({ error: { message: 'Enter a valid email address.' } });
-    if (password.length < 10 || password.length > 200) return response.status(400).json({ error: { message: 'Use a password with at least 10 characters.' } });
-    if (process.env.NODE_ENV === 'production' && !emailDeliveryConfigured()) return response.status(503).json({ error: { message: 'Email verification is temporarily unavailable. Please try again later.' } });
-    const result = await db().query('INSERT INTO users (full_name, email, password_hash) VALUES ($1, $2, $3) RETURNING id, full_name, email', [fullName, email, await hashPassword(password)]);
-    const user = result.rows[0];
-    const verification = await issueVerification(user);
-    response.status(201).json({ email: user.email, ...verification });
-  } catch (error) {
-    if (error.code === '23505') return response.status(409).json({ error: { message: 'An account with that email already exists.' } });
-    next(error);
+async function verifyFirebaseToken(token) {
+  const projectId = firebaseProjectId();
+  if (!projectId) throw Object.assign(new Error('Firebase is not configured on the API.'), { status: 503 });
+  const { payload } = await jwtVerify(token, firebaseKeys, {
+    issuer: `https://securetoken.google.com/${projectId}`,
+    audience: projectId,
+    algorithms: ['RS256'],
+  });
+  if (typeof payload.sub !== 'string' || !payload.sub || payload.email_verified !== true || typeof payload.email !== 'string') {
+    throw Object.assign(new Error('Verify your email address before signing in.'), { status: 403, code: 'EMAIL_NOT_VERIFIED' });
   }
-});
+  return {
+    uid: payload.sub,
+    email: payload.email.trim().toLowerCase(),
+    fullName: typeof payload.name === 'string' && payload.name.trim() ? payload.name.trim().slice(0, 120) : payload.email.split('@')[0].slice(0, 120),
+  };
+}
 
-router.post('/login', async (request, response, next) => {
-  try {
-    const email = String(request.body.email || '').trim().toLowerCase();
-    const password = String(request.body.password || '');
-    const result = await db().query('SELECT id, full_name, email, password_hash, email_verified_at FROM users WHERE email = $1', [email]);
-    if (!result.rowCount || !(await verifyPassword(password, result.rows[0].password_hash))) return response.status(401).json({ error: { message: 'Email or password is incorrect.' } });
-    if (!result.rows[0].email_verified_at) return response.status(403).json({ error: { code: 'EMAIL_NOT_VERIFIED', email: result.rows[0].email, message: 'Check your inbox and verify your email before signing in.' } });
-    const { password_hash, ...user } = result.rows[0];
-    await startSession(user.id, response);
-    response.json({ user });
-  } catch (error) { next(error); }
-});
-
-router.post('/resend-verification', async (request, response, next) => {
-  try {
-    const email = String(request.body.email || '').trim().toLowerCase();
-    const result = await db().query('SELECT id, email, email_verified_at FROM users WHERE email = $1', [email]);
-    let verificationUrl;
-    if (result.rowCount && !result.rows[0].email_verified_at) {
-      const user = result.rows[0];
-      const recent = await db().query(`SELECT 1 FROM email_verifications WHERE user_id = $1 AND created_at > NOW() - INTERVAL '60 seconds' LIMIT 1`, [user.id]);
-      if (!recent.rowCount && (process.env.NODE_ENV !== 'production' || emailDeliveryConfigured())) {
-        const issued = await issueVerification(user);
-        verificationUrl = issued.verificationUrl;
-      }
-    }
-    response.json({ message: 'If that address has an unverified account, a verification link is on its way.', ...(verificationUrl ? { verificationUrl } : {}) });
-  } catch (error) { next(error); }
-});
-
-router.post('/verify-email', async (request, response, next) => {
-  const token = String(request.body.token || '');
-  if (!token || token.length > 200) return response.status(400).json({ error: { message: 'This verification link is invalid or expired.' } });
+async function findOrCreateUser(identity) {
   const client = await db().connect();
   try {
     await client.query('BEGIN');
-    const result = await client.query(`SELECT id, user_id FROM email_verifications WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW() FOR UPDATE`, [hashToken(token)]);
-    if (!result.rowCount) { await client.query('ROLLBACK'); return response.status(400).json({ error: { message: 'This verification link is invalid or expired. Request a new one and try again.' } }); }
-    await client.query('UPDATE users SET email_verified_at = COALESCE(email_verified_at, NOW()) WHERE id = $1', [result.rows[0].user_id]);
-    await client.query('UPDATE email_verifications SET used_at = NOW() WHERE user_id = $1 AND used_at IS NULL', [result.rows[0].user_id]);
+    const byUid = await client.query('SELECT id, full_name, email, firebase_uid FROM users WHERE firebase_uid = $1 FOR UPDATE', [identity.uid]);
+    if (byUid.rowCount) {
+      const current = byUid.rows[0];
+      if (current.email === identity.email) {
+        await client.query('COMMIT');
+        return { id: current.id, full_name: current.full_name, email: current.email };
+      }
+      const emailOwner = await client.query('SELECT id FROM users WHERE email = $1 AND id <> $2', [identity.email, current.id]);
+      if (emailOwner.rowCount) throw Object.assign(new Error('This email is already linked to another workspace account.'), { status: 409 });
+      const result = await client.query('UPDATE users SET email = $1, full_name = $2, email_verified_at = COALESCE(email_verified_at, NOW()), updated_at = NOW() WHERE id = $3 RETURNING id, full_name, email', [identity.email, identity.fullName, current.id]);
+      await client.query('COMMIT');
+      return result.rows[0];
+    }
+
+    const byEmail = await client.query('SELECT id, full_name, email, firebase_uid FROM users WHERE email = $1 FOR UPDATE', [identity.email]);
+    if (byEmail.rowCount) {
+      if (byEmail.rows[0].firebase_uid && byEmail.rows[0].firebase_uid !== identity.uid) {
+        throw Object.assign(new Error('This email is already linked to a different sign-in account.'), { status: 409 });
+      }
+      const result = await client.query('UPDATE users SET firebase_uid = $1, email_verified_at = COALESCE(email_verified_at, NOW()), updated_at = NOW() WHERE id = $2 RETURNING id, full_name, email', [identity.uid, byEmail.rows[0].id]);
+      await client.query('COMMIT');
+      return result.rows[0];
+    }
+
+    const result = await client.query('INSERT INTO users (full_name, email, password_hash, email_verified_at, firebase_uid) VALUES ($1, $2, NULL, NOW(), $3) RETURNING id, full_name, email', [identity.fullName, identity.email, identity.uid]);
     await client.query('COMMIT');
-    response.json({ verified: true, message: 'Email verified. You can now sign in.' });
-  } catch (error) { try { await client.query('ROLLBACK'); } catch {} next(error); }
-  finally { client.release(); }
-});
+    return result.rows[0];
+  } catch (error) {
+    try { await client.query('ROLLBACK'); } catch {}
+    if (error.code === '23505') throw Object.assign(new Error('This sign-in account is already linked. Please sign in with its original provider.'), { status: 409 });
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function requireAuth(request, response, next) {
+  try {
+    const authorization = request.headers.authorization || '';
+    const token = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
+    if (!token) return response.status(401).json({ error: { message: 'Please sign in to continue.' } });
+    const identity = await verifyFirebaseToken(token);
+    request.user = await findOrCreateUser(identity);
+    next();
+  } catch (error) {
+    const status = error.status || (error.code === 'ERR_JWT_EXPIRED' || error.code?.startsWith('ERR_JWT_') ? 401 : 401);
+    response.status(status).json({ error: { ...(error.code ? { code: error.code } : {}), message: status === 401 ? 'Your sign-in expired. Please sign in again.' : error.message } });
+  }
+}
 
 router.get('/me', requireAuth, (request, response) => response.json({ user: request.user }));
-
-router.post('/logout', requireAuth, async (request, response, next) => {
-  try {
-    await db().query('DELETE FROM sessions WHERE id = $1', [hashToken(request.sessionId)]);
-    response.setHeader('Set-Cookie', `${cookieName}=; ${cookieOptions().replace(`Max-Age=${60 * 60 * 24 * 14}`, 'Max-Age=0')}`);
-    response.json({ ok: true });
-  } catch (error) { next(error); }
-});
+router.post('/logout', (_request, response) => response.json({ ok: true }));
 
 router.post('/invites/:token/accept', requireAuth, async (request, response, next) => {
   const client = await db().connect();
